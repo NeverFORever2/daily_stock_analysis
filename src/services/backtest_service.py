@@ -13,11 +13,9 @@ from sqlalchemy import and_, select
 from data_provider.base import canonical_stock_code, normalize_stock_code
 from src.config import get_config
 from src.core.backtest_engine import OVERALL_SENTINEL_CODE, BacktestEngine, EvaluationConfig
-from src.core.trading_calendar import resolve_historical_daily_bar_date
 from src.market_phase_summary import (
     extract_market_phase_summary,
     normalize_analysis_phase_bucket,
-    rebuild_market_phase_summary_for_stock_code,
 )
 from src.repositories.backtest_repo import BacktestRepository
 from src.repositories.stock_repo import StockRepository
@@ -25,7 +23,11 @@ from src.schemas.decision_action import build_action_fields
 from src.services.stock_code_utils import (
     normalize_code as normalize_backtest_code,
     resolve_daily_stock_identity,
+    _build_market_code_variants,
+    _normalize_code_and_exchange,
 )
+from src.services.stock_list_parser import AnalysisTarget
+from src.services.stock_daily_start_resolver import resolve_stock_daily_start
 from src.services.stock_daily_window_resolver import resolve_stock_daily_window
 from src.storage import BacktestResult, BacktestSummary, DatabaseManager
 from src.utils.data_processing import parse_json_field
@@ -124,39 +126,25 @@ class BacktestService:
                         )
                     )
                     continue
-                phase_summary = extract_market_phase_summary(
-                    analysis.context_snapshot
+                start_resolution = resolve_stock_daily_start(
+                    stock_code=analysis.code,
+                    context_snapshot=analysis.context_snapshot,
+                    analysis_date=analysis_date,
                 )
-                persisted_market = (
-                    str(phase_summary.get("market") or "").strip().lower()
-                    if isinstance(phase_summary, dict)
-                    else None
-                )
-                daily_identity = resolve_daily_stock_identity(
-                    analysis.code,
-                    market_hint=persisted_market,
-                )
+                daily_identity = start_resolution.identity
                 daily_code_candidates = (
                     list(daily_identity.code_candidates)
                     if daily_identity is not None
                     else []
                 )
-                expected_start_date = self._resolve_expected_start_date(
-                    analysis=analysis,
-                    analysis_date=analysis_date,
-                    market=daily_identity.market if daily_identity is not None else None,
-                    stock_code=(
-                        daily_identity.normalized_code
-                        if daily_identity is not None
-                        else None
-                    ),
-                )
+                expected_start_date = start_resolution.expected_start_date
+                local_start_date = start_resolution.backtest_start_date
                 daily_window = None
-                if expected_start_date is not None:
+                if local_start_date is not None:
                     daily_window = resolve_stock_daily_window(
                         stock_repo=self.stock_repo,
                         code_candidates=daily_code_candidates,
-                        expected_start_date=expected_start_date,
+                        expected_start_date=local_start_date,
                         eval_window_days=int(eval_window_days),
                     )
 
@@ -462,6 +450,49 @@ class BacktestService:
         return BacktestService._normalize_code(code)
 
     @staticmethod
+    def _validated_read_candidates(code: Optional[str], target: AnalysisTarget) -> tuple[str, ...]:
+        """Format a frozen stock target, without index-based market discovery.
+
+        CN's normal writer stores numeric summaries and may store numeric
+        details. Admit only that target's writer key; repository checks its
+        linked analysis ownership. Offshore suffixes are never stripped.
+        """
+        if (not isinstance(target, AnalysisTarget) or target.asset_type != "stock"
+                or target.raw_input != code or not target.normalized_code):
+            raise ValueError("Backtest read lost its validated stock target")
+        base, exchange = target.normalized_code, target.exchange
+        if exchange in {"SH", "SZ", "BJ", "HK"}:
+            expected = f"{exchange.lower()}{base}"
+        elif exchange in {"T", "KS", "KQ", "TW", "TWO"}:
+            expected = base
+        elif exchange == "US":
+            expected = base.upper().removesuffix(".US")
+        else:
+            raise ValueError("Unsupported validated backtest exchange")
+        canonical = target.canonical_id
+        normalized, parsed_exchange = _normalize_code_and_exchange(canonical)
+        if canonical != expected or normalized is None or (exchange != "US" and parsed_exchange != exchange):
+            raise ValueError("Inconsistent validated backtest identity")
+        candidates = [canonical, canonical.upper()]
+        candidates.extend(_build_market_code_variants(canonical, normalized, exchange))
+        writer_code = BacktestService._normalize_summary_code(canonical)
+        if exchange in {"SH", "SZ", "BJ"} and writer_code == normalized:
+            candidates.append(writer_code)
+        return tuple(dict.fromkeys(value for value in candidates
+                                   if not value.isdigit() or value == writer_code and exchange in {"SH", "SZ", "BJ"}))
+
+    @staticmethod
+    def _read_identity(code, analysis_target, *, analysis_date_from, analysis_date_to, analysis_phase):
+        if analysis_target is None:
+            return BacktestService._normalize_code(code), {}
+        # This internal seam is for the tool's cached summary and paginated read,
+        # not dynamic date/phase aggregation. Never silently drop its constraint.
+        if analysis_date_from is not None or analysis_date_to is not None or analysis_phase is not None:
+            raise ValueError("Validated backtest tool reads do not support dynamic filters")
+        candidates = BacktestService._validated_read_candidates(code, analysis_target)
+        return code, {"code_candidates": candidates}
+
+    @staticmethod
     def _build_run_diagnostics(
         *,
         code: Optional[str],
@@ -521,10 +552,14 @@ class BacktestService:
         analysis_date_from: Optional[date] = None,
         analysis_date_to: Optional[date] = None,
         analysis_phase: Optional[str] = None,
+        analysis_target: Optional[AnalysisTarget] = None,
     ) -> Dict[str, Any]:
         config = get_config()
         engine_version = str(getattr(config, "backtest_engine_version", "v1"))
-        code = self._normalize_code(code)
+        code, identity_kwargs = self._read_identity(
+            code, analysis_target, analysis_date_from=analysis_date_from,
+            analysis_date_to=analysis_date_to, analysis_phase=analysis_phase,
+        )
 
         phase_bucket = self._normalize_phase_filter(analysis_phase)
         if eval_window_days is None and (analysis_date_from is not None or analysis_date_to is not None or phase_bucket is not None):
@@ -556,6 +591,7 @@ class BacktestService:
             days=None,
             offset=offset,
             limit=limit,
+            **identity_kwargs,
         )
         items = []
         for result, stock_name, trend_prediction, _created_at, context_snapshot, raw_result, report_type, analysis_sentiment_score in rows:
@@ -583,10 +619,16 @@ class BacktestService:
         analysis_date_from: Optional[date] = None,
         analysis_date_to: Optional[date] = None,
         analysis_phase: Optional[str] = None,
+        analysis_target: Optional[AnalysisTarget] = None,
     ) -> Optional[Dict[str, Any]]:
         config = get_config()
         engine_version = str(getattr(config, "backtest_engine_version", "v1"))
-        code = self._normalize_code(code)
+        if analysis_target is not None and scope != "stock":
+            raise ValueError("Validated backtest identity requires stock scope")
+        code, identity_kwargs = self._read_identity(
+            code, analysis_target, analysis_date_from=analysis_date_from,
+            analysis_date_to=analysis_date_to, analysis_phase=analysis_phase,
+        )
         lookup_code = OVERALL_SENTINEL_CODE if scope == "overall" else code
 
         phase_bucket = self._normalize_phase_filter(analysis_phase)
@@ -664,6 +706,7 @@ class BacktestService:
             code=lookup_code,
             eval_window_days=eval_window_days,
             engine_version=engine_version,
+            **identity_kwargs,
         )
         if summary is None:
             return None
@@ -844,63 +887,6 @@ class BacktestService:
             return analysis.created_at.date()
         logger.warning(f"无法确定分析日期，跳过记录: {analysis.code}#{getattr(analysis, 'id', '?')}")
         return None
-
-    @staticmethod
-    def _resolve_expected_start_date(
-        *,
-        analysis,
-        analysis_date: date,
-        market: Optional[str],
-        stock_code: Optional[str],
-    ) -> Optional[date]:
-        phase_summary = extract_market_phase_summary(analysis.context_snapshot)
-        snapshot_market = (
-            str(phase_summary.get("market") or "").strip().lower()
-            if isinstance(phase_summary, dict)
-            else ""
-        )
-        if not market:
-            return None
-        if snapshot_market != market:
-            phase_summary = rebuild_market_phase_summary_for_stock_code(
-                stock_code,
-                analysis.context_snapshot,
-            )
-            snapshot_market = (
-                str(phase_summary.get("market") or "").strip().lower()
-                if isinstance(phase_summary, dict)
-                else ""
-            )
-            if snapshot_market != market:
-                return None
-
-        effective_date_value = (
-            phase_summary.get("effective_daily_bar_date")
-            if isinstance(phase_summary, dict)
-            else None
-        )
-        if effective_date_value:
-            try:
-                effective_date = datetime.strptime(
-                    str(effective_date_value),
-                    "%Y-%m-%d",
-                ).date()
-            except (TypeError, ValueError):
-                return None
-            if effective_date <= analysis_date:
-                return effective_date
-            return None
-
-        phase = (
-            phase_summary.get("phase")
-            if isinstance(phase_summary, dict)
-            else None
-        )
-        return resolve_historical_daily_bar_date(
-            market,
-            analysis_date,
-            phase,
-        )
 
     def _try_fill_daily_data(self, *, code: str, analysis_date: date, eval_window_days: int) -> None:
         refill_code = str(code or "").strip()
